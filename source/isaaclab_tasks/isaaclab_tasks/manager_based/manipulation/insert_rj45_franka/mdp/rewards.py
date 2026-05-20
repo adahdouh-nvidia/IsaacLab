@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+import isaaclab.envs.mdp as base_mdp
 from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
 from isaaclab.utils import math as math_utils
 
@@ -18,6 +19,21 @@ if TYPE_CHECKING:
     from isaaclab.assets import Articulation, RigidObject
     from isaaclab.envs import ManagerBasedRLEnv
     from isaaclab.sensors import FrameTransformer
+
+
+def _finite(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a finite tensor by replacing invalid values with zeros."""
+    return torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _finite_quat(quat: torch.Tensor) -> torch.Tensor:
+    """Return normalized finite quaternions, falling back to identity."""
+    quat = _finite(quat)
+    norm = torch.linalg.norm(quat, dim=-1, keepdim=True)
+    quat = quat / torch.clamp(norm, min=1e-6)
+    identity = torch.zeros_like(quat)
+    identity[..., 3] = 1.0
+    return torch.where(norm > 1e-6, quat, identity)
 
 
 def _resolve_joint_ids(robot: Articulation, asset_cfg: SceneEntityCfg) -> list[int] | slice:
@@ -48,9 +64,9 @@ def ee_to_plug_distance(
     """
     plug: RigidObject = env.scene[plug_cfg.name]
     ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
-    ee_pos_w = ee_frame.data.target_pos_w.torch[..., 0, :]
-    distance = torch.linalg.norm(plug.data.root_pos_w.torch - ee_pos_w, dim=1)
-    return 1.0 - torch.tanh(distance / std)
+    ee_pos_w = _finite(ee_frame.data.target_pos_w.torch[..., 0, :])
+    distance = torch.linalg.norm(_finite(plug.data.root_pos_w.torch) - ee_pos_w, dim=1)
+    return _finite(1.0 - torch.tanh(distance / std))
 
 
 def plug_to_socket_distance(
@@ -72,8 +88,8 @@ def plug_to_socket_distance(
     """
     plug: RigidObject = env.scene[plug_cfg.name]
     socket: RigidObject = env.scene[socket_cfg.name]
-    distance = torch.linalg.norm(socket.data.root_pos_w.torch - plug.data.root_pos_w.torch, dim=1)
-    return 1.0 - torch.tanh(distance / std)
+    distance = torch.linalg.norm(_finite(socket.data.root_pos_w.torch) - _finite(plug.data.root_pos_w.torch), dim=1)
+    return _finite(1.0 - torch.tanh(distance / std))
 
 
 def plug_grasped(
@@ -99,12 +115,14 @@ def plug_grasped(
     """
     plug: RigidObject = env.scene[plug_cfg.name]
     ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
-    ee_pos_w = ee_frame.data.target_pos_w.torch[..., 0, :]
+    ee_pos_w = _finite(ee_frame.data.target_pos_w.torch[..., 0, :])
     offset_b = torch.tensor(grasp_offset, device=env.device, dtype=torch.float32).repeat(env.num_envs, 1)
-    grasp_pos_w = plug.data.root_pos_w.torch + math_utils.quat_apply(plug.data.root_quat_w.torch, offset_b)
+    grasp_pos_w = _finite(plug.data.root_pos_w.torch) + math_utils.quat_apply(
+        _finite_quat(plug.data.root_quat_w.torch), offset_b
+    )
     distance = torch.linalg.norm(grasp_pos_w - ee_pos_w, dim=1)
     slip_distance = torch.clamp(distance - hold_radius, min=0.0)
-    return 1.0 - torch.tanh(slip_distance / std)
+    return _finite(1.0 - torch.tanh(slip_distance / std))
 
 
 def gripper_closed(
@@ -126,9 +144,9 @@ def gripper_closed(
     """
     robot: Articulation = env.scene[robot_cfg.name]
     joint_ids = _resolve_joint_ids(robot, robot_cfg)
-    finger_pos = robot.data.joint_pos.torch[:, joint_ids]
+    finger_pos = _finite(robot.data.joint_pos.torch[:, joint_ids])
     opening_error = torch.clamp(finger_pos - target_position, min=0.0).mean(dim=1)
-    return 1.0 - torch.tanh(opening_error / std)
+    return _finite(1.0 - torch.tanh(opening_error / std))
 
 
 class insertion_bonus(ManagerTermBase):
@@ -165,9 +183,12 @@ class insertion_bonus(ManagerTermBase):
         """
         plug: RigidObject = env.scene[plug_cfg.name]
         socket: RigidObject = env.scene[socket_cfg.name]
-        distance = torch.linalg.norm(socket.data.root_pos_w.torch - plug.data.root_pos_w.torch, dim=1)
-        engaged = distance < engaged_threshold
-        self._succeeded |= distance < success_threshold
+        plug_pos_w = plug.data.root_pos_w.torch
+        socket_pos_w = socket.data.root_pos_w.torch
+        valid = torch.isfinite(plug_pos_w).all(dim=1) & torch.isfinite(socket_pos_w).all(dim=1)
+        distance = torch.linalg.norm(_finite(socket_pos_w) - _finite(plug_pos_w), dim=1)
+        engaged = valid & (distance < engaged_threshold)
+        self._succeeded |= valid & (distance < success_threshold)
         return engaged.float()
 
 
@@ -192,5 +213,33 @@ def plug_upright(
     """
     plug: RigidObject = env.scene[plug_cfg.name]
     axis_b = torch.tensor(plug_up_axis, device=env.device, dtype=torch.float32).repeat(env.num_envs, 1)
-    axis_w = math_utils.quat_apply(plug.data.root_quat_w.torch, axis_b)
-    return 1.0 - torch.clamp(axis_w[:, 2], min=-1.0, max=1.0)
+    axis_w = math_utils.quat_apply(_finite_quat(plug.data.root_quat_w.torch), axis_b)
+    return _finite(1.0 - torch.clamp(axis_w[:, 2], min=-1.0, max=1.0))
+
+
+def action_rate_l2_finite(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return a finite action-rate penalty.
+
+    Args:
+        env: The environment instance.
+
+    Returns:
+        Action-rate penalty with shape ``(num_envs,)``.
+    """
+    return _finite(base_mdp.action_rate_l2(env))
+
+
+def joint_vel_l2_finite(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return a finite joint-velocity penalty.
+
+    Args:
+        env: The environment instance.
+        asset_cfg: Articulation entity whose joint velocities are penalized.
+
+    Returns:
+        Joint-velocity penalty with shape ``(num_envs,)``.
+    """
+    return _finite(base_mdp.joint_vel_l2(env, asset_cfg))

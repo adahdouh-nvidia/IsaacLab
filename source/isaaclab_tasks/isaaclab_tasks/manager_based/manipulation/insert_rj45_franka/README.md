@@ -16,9 +16,15 @@ Then split it into Isaac-Lab-ready USDs:
 ./isaaclab.sh -p source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/insert_rj45_franka/scripts/split_rj45_usd.py
 ```
 
-This writes `rj45_plug_body.usd` and `rj45_socket.usd`. The plug USD contains both the jack body and the clip/latch as one rigid body, so the clip cannot fall away from the gripper. The cable is intentionally omitted because faithful cable behavior needs constraints that are not configured in this first port.
+This writes `rj45_plug_body.usd` and `rj45_socket.usd`. The plug USD contains both the jack body and the
+clip/latch as one rigid body, so the clip cannot fall away from the gripper.
 
-If the plug body and clip appear separated in the viewer, rerun the splitter above so the standalone plug USD is regenerated with the body and clip in one normalized rigid frame.
+The USD-backed task reads `CableCurve` from the combined source asset at runtime and adds a Newton capsule-chain
+cable to each environment. The source path defaults to `~/isaaclab_assets/rj45/rj45_plug.usd`; set
+`ISAACLAB_RJ45_ASSET_DIR` if your combined asset lives elsewhere.
+
+If the plug body and clip appear separated in the viewer, rerun the splitter above so the standalone plug USD is
+regenerated with the body and clip in one normalized rigid frame.
 
 ## Run
 
@@ -38,10 +44,27 @@ Play variants are available as `Isaac-Insert-RJ45-Franka-Play-v0` and `Isaac-Ins
 
 ## Design Notes
 
-The plug starts pinched in the gripper at a fixed environment-frame pose near the Franka default TCP: `(0.485, 0.0, 0.39)`. Its reset orientation adds a 90-degree yaw so the exposed connector end points toward the socket. The socket starts close by at `(0.495, 0.0, 0.39)` so early training focuses on the final insertion motion instead of long-range reaching. The reset event does not read the TCP from `FrameTransformer` because body poses are stale until the next sim step.
+The plug starts pinched in the gripper at a fixed environment-frame pose near the Franka default TCP:
+`(0.485, 0.0, 0.39)`. Its reset orientation adds a 90-degree yaw so the exposed connector end points toward the
+socket. The socket starts close by at `(0.54, 0.0, 0.39)` so early training focuses on the final insertion motion
+instead of long-range reaching. The reset event does not read the TCP from `FrameTransformer` because body poses are
+stale until the next sim step.
 
-The socket is kinematic, while the plug is one dynamic rigid object with gravity disabled for this insertion-only bootstrap. It includes the clip/latch mesh, so modeling the clip as a separate free body is avoided; adding a true hinged latch remains a focused follow-up.
+The socket is kinematic, while the plug is one dynamic rigid object with gravity disabled for this insertion-only
+bootstrap. It includes the clip/latch mesh, so modeling the clip as a separate free body is avoided; adding a true
+hinged latch remains a focused follow-up.
 
-The reward includes grasp-maintenance terms: one keeps a plug-frame grasp point behind the exposed connector near the TCP, and one rewards the finger joints staying at the tight grasp target. These terms are intentionally active for the whole episode so the policy does not trade away grasp stability while chasing insertion distance.
+The USD-backed task also installs a Newton builder hook that adds one bend-stiff capsule-chain cable per environment.
+The chain uses MJWarp-compatible D6 joints because MJWarp does not currently convert Newton's `JointType.CABLE`.
+The cable root is fixed to the plug body, and the first four cable bodies follow the plug before the solver runs,
+matching Newton's RJ45 example. In this D6 fallback, the chain is never fixed to the world because that makes the cable
+look static when the plug moves; non-root D6 children also keep normal mass because zero-mass children can destabilize
+MJWarp. The middle links remain dynamic so the cable can sag and settle on the table. The stub task intentionally stays
+cable-free.
 
-For Newton+MJWarp, Franka rigid-body gravity is disabled because the Panda USD has unauthored `MassAPI` on several links, causing Newton to use invalid mass/inertia fallbacks. You may still see cosmetic inertia warnings from Newton.
+The reward includes grasp-maintenance terms: one keeps a plug-frame grasp point behind the exposed connector near the
+TCP, and one rewards the finger joints staying at the tight grasp target. These terms are intentionally active for the
+whole episode so the policy does not trade away grasp stability while chasing insertion distance.
+
+For Newton+MJWarp, Franka rigid-body gravity is disabled because the Panda USD has unauthored `MassAPI` on several
+links, causing Newton to use invalid mass/inertia fallbacks. You may still see cosmetic inertia warnings from Newton.

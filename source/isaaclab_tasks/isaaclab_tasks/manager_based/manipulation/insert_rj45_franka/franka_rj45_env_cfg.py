@@ -33,6 +33,7 @@ from isaaclab.utils.noise import UniformNoiseCfg as Unoise
 from isaaclab_tasks.utils import PresetCfg
 
 from . import mdp
+from .mdp import cable as cable_mdp
 
 ##
 # Pre-defined configs
@@ -54,7 +55,7 @@ This keeps the RJ45 upright flip and adds a 90-degree yaw so the plug points
 outward from the gripper instead of sideways into the socket.
 """
 
-SOCKET_POS = (0.495, HELD_PLUG_POS[1], HELD_PLUG_POS[2])
+SOCKET_POS = (0.54, HELD_PLUG_POS[1], HELD_PLUG_POS[2])
 """Socket root position for the near-insertion reset [m]."""
 
 PLUG_GRASP_OFFSET = (0.0, -0.025, 0.0)
@@ -87,8 +88,8 @@ class RJ45SimCfg(PresetCfg):
         gravity=(0.0, 0.0, -9.81),
         physics=NewtonCfg(
             solver_cfg=MJWarpSolverCfg(
-                njmax=120,
-                nconmax=80,
+                njmax=256,
+                nconmax=160,
                 cone="pyramidal",
                 integrator="implicitfast",
                 impratio=1,
@@ -331,10 +332,10 @@ class RewardsCfg:
 
     plug_upright = RewTerm(func=mdp.plug_upright, weight=-0.5)
 
-    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-2)
+    action_rate = RewTerm(func=mdp.action_rate_l2_finite, weight=-1e-2)
 
     joint_vel = RewTerm(
-        func=mdp.joint_vel_l2,
+        func=mdp.joint_vel_l2_finite,
         weight=-1e-4,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
@@ -370,7 +371,7 @@ class FrankaRJ45InsertEnvCfg(ManagerBasedRLEnvCfg):
     events: RJ45EventCfg = RJ45EventCfg()
 
     def __post_init__(self) -> None:
-        """Post-initialize task timing, viewer, and Franka backend workaround."""
+        """Post-initialize task timing, viewer, Franka settings, and cable hooks."""
         self.decimation = 2
         self.episode_length_s = 10.0
 
@@ -385,6 +386,11 @@ class FrankaRJ45InsertEnvCfg(ManagerBasedRLEnvCfg):
         self.viewer.env_index = 0
         self.viewer.eye = (1.0, -1.0, 0.65)
         self.viewer.lookat = (0.49, 0.0, 0.39)
+
+        cable_mdp.register_cable_callbacks(
+            self,
+            source_usd_path=os.path.join(os.environ.get("ISAACLAB_RJ45_ASSET_DIR", ASSET_DIR), "rj45_plug.usd"),
+        )
 
 
 @configclass
