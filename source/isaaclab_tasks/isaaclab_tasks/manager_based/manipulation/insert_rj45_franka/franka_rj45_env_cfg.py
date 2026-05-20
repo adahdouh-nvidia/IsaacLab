@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import os
 
-from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
+from isaaclab_contrib.deformable.newton_manager_cfg import VBDSolverCfg
+from isaaclab_contrib.deformable.vbd_manager import NewtonVBDManager
+from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg, NewtonManager
 from isaaclab_physx.physics import PhysxCfg
 
 import isaaclab.sim as sim_utils
@@ -66,8 +68,50 @@ GRIPPER_GRASP_POS = 0.005
 
 
 @configclass
+class RJ45VBDSolverCfg(VBDSolverCfg):
+    """VBD solver settings for the RJ45 rod cable."""
+
+    class_type: type[NewtonManager] | str = "{DIR}.franka_rj45_env_cfg:NewtonRJ45VBDManager"
+    """Manager class for the RJ45 VBD rod-cable simulation."""
+
+    friction_epsilon: float = 0.1
+    """Friction smoothing epsilon for VBD rigid contacts."""
+
+    rigid_body_contact_buffer_size: int = 256
+    """Per-rigid-body contact buffer size."""
+
+
+class NewtonRJ45VBDManager(NewtonVBDManager):
+    """Task-local VBD manager that supports rigid rods without particles."""
+
+    @classmethod
+    def _simulate_full(cls) -> None:
+        """Run actuators and VBD cable substeps with anchor sync before collision."""
+        physics_dt = cls._solver_dt * cls._num_substeps
+        contacts = cls._contacts if cls._needs_collision_pipeline else None
+
+        for _ in range(cls._decimation):
+            if cls._adapter is not None:
+                cls._adapter.step(cls._state_0, cls._control, physics_dt)
+            for callback in cls._post_actuator_callbacks:
+                callback()
+            cable_mdp.run_vbd_cable_solver_substeps(cls)
+
+        cls._update_sensors(contacts)
+
+    @classmethod
+    def _simulate_physics_only(cls) -> None:
+        """Run VBD physics while skipping particle BVH work for rod-only scenes."""
+        if getattr(cls._model, "particle_count", 0) > 0 and hasattr(cls._solver, "rebuild_bvh"):
+            cls._solver.rebuild_bvh(cls._state_0)
+        contacts = cls._contacts if cls._needs_collision_pipeline else None
+        cable_mdp.run_vbd_cable_solver_substeps(cls)
+        cls._update_sensors(contacts)
+
+
+@configclass
 class RJ45SimCfg(PresetCfg):
-    """Simulation presets for PhysX and Newton+MJWarp backends."""
+    """Simulation presets for PhysX, Newton+MJWarp, and Newton+VBD backends."""
 
     physx: SimulationCfg = SimulationCfg(
         dt=1.0 / 120.0,
@@ -93,6 +137,24 @@ class RJ45SimCfg(PresetCfg):
                 cone="pyramidal",
                 integrator="implicitfast",
                 impratio=1,
+            ),
+            num_substeps=1,
+            debug_mode=False,
+            use_cuda_graph=True,
+        ),
+        physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=1.0, dynamic_friction=1.0),
+    )
+
+    newton_vbd: SimulationCfg = SimulationCfg(
+        dt=1.0 / 600.0,
+        render_interval=1,
+        gravity=(0.0, 0.0, -9.81),
+        physics=NewtonCfg(
+            solver_cfg=RJ45VBDSolverCfg(
+                iterations=12,
+                friction_epsilon=0.1,
+                rigid_contact_k_start=1.0e5,
+                rigid_body_contact_buffer_size=256,
             ),
             num_substeps=1,
             debug_mode=False,
@@ -298,6 +360,7 @@ class RJ45EventCfg(PresetCfg):
     default: EventCfg = EventCfg()
     physx: EventCfg = EventCfg()
     newton_mjwarp: EventCfg = EventCfg()
+    newton_vbd: EventCfg = EventCfg()
 
 
 @configclass
