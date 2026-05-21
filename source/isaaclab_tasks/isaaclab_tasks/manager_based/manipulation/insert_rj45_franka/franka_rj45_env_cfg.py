@@ -9,9 +9,8 @@ from __future__ import annotations
 
 import os
 
-from isaaclab_contrib.deformable.newton_manager_cfg import VBDSolverCfg
-from isaaclab_contrib.deformable.vbd_manager import NewtonVBDManager
 from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg, NewtonManager
+from isaaclab_newton.physics.mjwarp_manager import NewtonMJWarpManager
 from isaaclab_physx.physics import PhysxCfg
 
 import isaaclab.sim as sim_utils
@@ -68,34 +67,39 @@ GRIPPER_GRASP_POS = 0.005
 
 
 @configclass
-class RJ45VBDSolverCfg(VBDSolverCfg):
-    """VBD solver settings for the RJ45 rod cable."""
+class RJ45SplitCableSolverCfg(MJWarpSolverCfg):
+    """MJWarp rigid scene with a task-local VBD sidecar for the RJ45 cable.
 
-    class_type: type[NewtonManager] | str = "{DIR}.franka_rj45_env_cfg:NewtonRJ45VBDManager"
-    """Manager class for the RJ45 VBD rod-cable simulation."""
+    The main Newton model contains only MJWarp-compatible rigid bodies: Franka,
+    plug, socket, table, ground, and a non-colliding cable proxy for rendering.
+    The true ``JointType.CABLE`` rod is built in a separate cable-only Newton
+    model that is stepped by :class:`NewtonRJ45SplitCableManager`.
+    """
 
-    friction_epsilon: float = 0.1
-    """Friction smoothing epsilon for VBD rigid contacts."""
+    class_type: type[NewtonManager] | str = "{DIR}.franka_rj45_env_cfg:NewtonRJ45SplitCableManager"
+    """Manager class that keeps rigid scene stepping and VBD cable stepping split."""
 
-    rigid_body_contact_buffer_size: int = 256
-    """Per-rigid-body contact buffer size."""
-
-    rigid_contact_hard: bool = False
-    """Whether VBD rigid contacts use hard contact constraints."""
+    solver_type: str = "rj45_mjwarp_vbd_cable"
+    """Task-local solver tag for MJWarp rigid bodies plus a VBD cable sidecar."""
 
 
-class NewtonRJ45VBDManager(NewtonVBDManager):
-    """Task-local VBD manager that supports rigid rods without particles."""
+class NewtonRJ45SplitCableManager(NewtonMJWarpManager):
+    """MJWarp manager with an extra per-substep VBD solve for the cable only."""
 
     @classmethod
-    def _build_solver(cls, model, solver_cfg) -> None:
-        """Build the VBD solver and make cable joints compliant."""
-        super()._build_solver(model, solver_cfg)
-        cable_mdp.configure_vbd_cable_solver(cls._solver, model)
+    def _run_solver_substeps(cls, contacts) -> None:
+        """Step rigid MJWarp physics, then the cable-only VBD sidecar."""
+        for _ in range(cls._num_substeps):
+            cable_mdp.sync_split_vbd_cable_from_rigid_state(cls._state_0)
+            if cls._needs_collision_pipeline:
+                cls._collision_pipeline.collide(cls._state_0, cls._contacts)
+            cls._step_solver(cls._state_0, cls._state_0, cls._control, contacts, cls._solver_dt)
+            cable_mdp.step_split_vbd_cable(cls._state_0, cls._solver_dt)
+            cls._state_0.clear_forces()
 
     @classmethod
     def _simulate_full(cls) -> None:
-        """Run actuators and VBD cable substeps with anchor sync before collision."""
+        """Run actuators and MJWarp rigid substeps with cable-only VBD substeps."""
         physics_dt = cls._solver_dt * cls._num_substeps
         contacts = cls._contacts if cls._needs_collision_pipeline else None
 
@@ -104,23 +108,26 @@ class NewtonRJ45VBDManager(NewtonVBDManager):
                 cls._adapter.step(cls._state_0, cls._control, physics_dt)
             for callback in cls._post_actuator_callbacks:
                 callback()
-            cable_mdp.run_vbd_cable_solver_substeps(cls)
+            cls._run_solver_substeps(contacts)
 
         cls._update_sensors(contacts)
 
     @classmethod
     def _simulate_physics_only(cls) -> None:
-        """Run VBD physics while skipping particle BVH work for rod-only scenes."""
-        if getattr(cls._model, "particle_count", 0) > 0 and hasattr(cls._solver, "rebuild_bvh"):
-            cls._solver.rebuild_bvh(cls._state_0)
+        """Run MJWarp rigid physics plus the cable-only VBD sidecar."""
         contacts = cls._contacts if cls._needs_collision_pipeline else None
-        cable_mdp.run_vbd_cable_solver_substeps(cls)
+        cls._run_solver_substeps(contacts)
         cls._update_sensors(contacts)
+
+
+# Compatibility aliases for local code that imported the earlier RJ45 names.
+RJ45VBDSolverCfg = RJ45SplitCableSolverCfg
+NewtonRJ45VBDManager = NewtonRJ45SplitCableManager
 
 
 @configclass
 class RJ45SimCfg(PresetCfg):
-    """Simulation presets for PhysX, Newton+MJWarp, and Newton+VBD backends."""
+    """Simulation presets for PhysX and the two supported Newton RJ45 paths."""
 
     physx: SimulationCfg = SimulationCfg(
         dt=1.0 / 120.0,
@@ -153,32 +160,41 @@ class RJ45SimCfg(PresetCfg):
         ),
         physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=1.0, dynamic_friction=1.0),
     )
+    """MJWarp rigid-body scene with the RJ45 cable represented as a D6 capsule-chain proxy."""
 
     newton_vbd: SimulationCfg = SimulationCfg(
         dt=1.0 / 600.0,
         render_interval=1,
         gravity=(0.0, 0.0, -9.81),
         physics=NewtonCfg(
-            solver_cfg=RJ45VBDSolverCfg(
-                iterations=12,
-                friction_epsilon=0.1,
-                rigid_contact_hard=False,
-                rigid_contact_k_start=1.0e5,
-                rigid_body_contact_buffer_size=256,
+            solver_cfg=RJ45SplitCableSolverCfg(
+                njmax=256,
+                nconmax=160,
+                cone="pyramidal",
+                integrator="implicitfast",
+                impratio=1,
             ),
             num_substeps=1,
             debug_mode=False,
-            use_cuda_graph=True,
+            # The sidecar VBD cable swaps state buffers in Python, so keep the
+            # faithful cable path eager until that loop is graph-captured too.
+            use_cuda_graph=False,
         ),
         physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=1.0, dynamic_friction=1.0),
     )
+    """MJWarp rigid scene plus a true Newton VBD rod cable sidecar."""
 
     default = physx
 
 
 @configclass
 class FrankaRJ45SceneCfg(InteractiveSceneCfg):
-    """Scene with a Franka, split RJ45 parts, table, ground, and lights."""
+    """Rigid scene with a Franka, split RJ45 parts, table, ground, and lights.
+
+    The flexible cable is not spawned here. It is added by the Newton builder
+    hooks in :mod:`.mdp.cable` so the backend can choose either the true VBD rod
+    path or the MJWarp-compatible rigid proxy.
+    """
 
     robot: ArticulationCfg = FRANKA_PANDA_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
@@ -460,6 +476,8 @@ class FrankaRJ45InsertEnvCfg(ManagerBasedRLEnvCfg):
         self.viewer.eye = (1.0, -1.0, 0.65)
         self.viewer.lookat = (0.49, 0.0, 0.39)
 
+        # Register only the cable extension. Robot, plug, and socket remain
+        # standard rigid assets from the scene config above.
         cable_mdp.register_cable_callbacks(
             self,
             source_usd_path=os.path.join(os.environ.get("ISAACLAB_RJ45_ASSET_DIR", ASSET_DIR), "rj45_plug.usd"),

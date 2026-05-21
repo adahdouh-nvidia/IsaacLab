@@ -12,10 +12,10 @@ open in the Newton :class:`ModelBuilder`, so each Isaac Lab environment gets
 one independent cable rod without reopening or guessing world scopes.
 
 Newton's upstream RJ45 example uses :meth:`ModelBuilder.add_rod`, which creates
-``JointType.CABLE`` joints. The task uses that faithful rod path when the
-``newton_vbd`` preset is active. MJWarp does not support ``JointType.CABLE`` in
-this Isaac Lab checkout, so the ``newton_mjwarp`` preset keeps a visually
-similar D6 capsule-chain fallback.
+``JointType.CABLE`` joints. MJWarp does not support those joints in this Isaac
+Lab checkout, so the ``newton_vbd`` preset keeps MJWarp as the rigid scene
+solver and builds the true rod in a separate cable-only VBD sidecar model. The
+``newton_mjwarp`` preset remains a rigid D6 capsule-chain approximation only.
 
 Implemented against Isaac Lab develop commit
 ``53bc3e02d7b1b798355cbbf2e155999bbff7a543``.
@@ -43,25 +43,25 @@ logger = logging.getLogger(__name__)
 CABLE_RADIUS: float = 0.00325
 """Cable capsule radius [m]."""
 
-CABLE_BEND_STIFFNESS: float = 1.0
-"""Cable bend stiffness [N*m/rad]."""
+CABLE_BEND_STIFFNESS: float = 0.1
+"""Reference cable bend stiffness [N*m/rad]."""
 
-CABLE_BEND_DAMPING: float = 0.02
-"""Cable bend damping."""
+CABLE_BEND_DAMPING: float = 0.1
+"""Reference cable bend damping."""
 
-CABLE_ROD_BEND_STIFFNESS: float = 0.01
+CABLE_ROD_BEND_STIFFNESS: float = CABLE_BEND_STIFFNESS
 """VBD rod bend stiffness [N*m/rad]."""
 
-CABLE_ROD_STRETCH_STIFFNESS: float = 2.0e4
+CABLE_ROD_STRETCH_STIFFNESS: float = 1.0e9
 """VBD rod stretch stiffness [N/m]."""
 
-CABLE_ROD_STRETCH_DAMPING: float = 0.0
+CABLE_ROD_STRETCH_DAMPING: float = 0.1
 """VBD rod stretch damping."""
 
-CABLE_CONTACT_KE: float = 2.0e4
+CABLE_CONTACT_KE: float = 1.0e8
 """Cable contact stiffness [N/m]."""
 
-CABLE_CONTACT_KD: float = 0.0
+CABLE_CONTACT_KD: float = 1.0e-3
 """Cable contact damping."""
 
 CABLE_ROD_CONTACT_KE: float = CABLE_CONTACT_KE
@@ -70,14 +70,32 @@ CABLE_ROD_CONTACT_KE: float = CABLE_CONTACT_KE
 CABLE_ROD_CONTACT_KD: float = CABLE_CONTACT_KD
 """VBD rod contact damping."""
 
-CABLE_FRICTION: float = 1.0
+CABLE_FRICTION: float = 2.0
 """Cable friction coefficient."""
 
 CABLE_RENDER_COLOR: wp.vec3 = wp.vec3(0.0, 0.65, 0.12)
 """Cable capsule render color."""
 
-CABLE_D6_BEND_STIFFNESS_SCALE: float = 2.0e-4
-"""Scale applied to the reference bend stiffness for the MJWarp D6 fallback."""
+CABLE_D6_BEND_STIFFNESS_SCALE: float = 2.0e-3
+"""Scale applied to keep the MJWarp D6 fallback's bend spring visually similar."""
+
+CABLE_D6_BEND_DAMPING: float = 0.02
+"""D6 proxy bend damping used by the MJWarp-compatible fallback."""
+
+CABLE_D6_CONTACT_KE: float = 2.0e4
+"""D6 proxy contact stiffness [N/m] used by the MJWarp-compatible fallback."""
+
+CABLE_D6_CONTACT_KD: float = 0.0
+"""D6 proxy contact damping used by the MJWarp-compatible fallback."""
+
+CABLE_D6_FRICTION: float = 1.0
+"""D6 proxy friction coefficient used by the MJWarp-compatible fallback."""
+
+CABLE_VISUAL_PROXY_MASS: float = 1.0e-4
+"""Tiny positive proxy body mass [kg] required by MuJoCo conversion."""
+
+CABLE_VISUAL_PROXY_INERTIA: float = 1.0e-8
+"""Tiny positive proxy body inertia [kg*m^2] required by MuJoCo conversion."""
 
 CABLE_KINEMATIC_COUNT: int = 4
 """First rod bodies that are teleported with the plug every solver step."""
@@ -113,12 +131,33 @@ class _CableState:
     physics_ready_handle: Any | None = None
     solver_type: str = ""
     uses_vbd_rods: bool = False
+    uses_split_vbd_sidecar: bool = False
+    sidecar_builder: Any | None = None
+    sidecar_model: Any | None = None
+    sidecar_state_0: Any | None = None
+    sidecar_state_1: Any | None = None
+    sidecar_control: Any | None = None
+    sidecar_solver: Any | None = None
+    sidecar_body_ids_per_env: list[list[int]] = field(default_factory=list)
+    sidecar_joint_ids: list[int] = field(default_factory=list)
+    sidecar_anchor_body_ids: list[int] = field(default_factory=list)
+    sidecar_anchor_offsets: list[wp.vec3] = field(default_factory=list)
+    sidecar_anchor_rotations: list[wp.quat] = field(default_factory=list)
+    sidecar_align_body_ids: list[int] = field(default_factory=list)
+    sidecar_align_next_body_ids: list[int] = field(default_factory=list)
     anchor_body_ids_wp: wp.array | None = None
     plug_body_ids_wp: wp.array | None = None
     anchor_offsets_wp: wp.array | None = None
     anchor_rotations_wp: wp.array | None = None
     align_body_ids_wp: wp.array | None = None
     align_next_body_ids_wp: wp.array | None = None
+    sidecar_anchor_body_ids_wp: wp.array | None = None
+    sidecar_anchor_offsets_wp: wp.array | None = None
+    sidecar_anchor_rotations_wp: wp.array | None = None
+    sidecar_align_body_ids_wp: wp.array | None = None
+    sidecar_align_next_body_ids_wp: wp.array | None = None
+    sidecar_body_ids_wp: wp.array | None = None
+    proxy_body_ids_wp: wp.array | None = None
 
 
 _STATE: _CableState | None = None
@@ -153,6 +192,50 @@ def _sync_cable_anchors_kernel(
     anchor_rot = wp.normalize(wp.mul(plug_rot, anchor_rotations[tid]))
     body_q[anchor_idx] = wp.transform(anchor_world, anchor_rot)
     body_qd[anchor_idx] = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+
+@wp.kernel
+def _sync_split_cable_anchors_kernel(
+    rigid_body_q: wp.array(dtype=wp.transform),
+    cable_body_q: wp.array(dtype=wp.transform),
+    cable_body_qd: wp.array(dtype=wp.spatial_vector),
+    plug_body_ids: wp.array(dtype=wp.int32),
+    anchor_body_ids: wp.array(dtype=wp.int32),
+    anchor_offsets: wp.array(dtype=wp.vec3),
+    anchor_rotations: wp.array(dtype=wp.quat),
+    prefix_count: int,
+) -> None:
+    """Teleport sidecar VBD prefix bodies to the current rigid plug pose."""
+    tid = wp.tid()
+    env_id = tid // prefix_count
+    plug_idx = plug_body_ids[env_id]
+    anchor_idx = anchor_body_ids[tid]
+
+    plug_tf = rigid_body_q[plug_idx]
+    plug_pos = wp.transform_get_translation(plug_tf)
+    plug_rot = wp.transform_get_rotation(plug_tf)
+
+    anchor_world = plug_pos + wp.quat_rotate(plug_rot, anchor_offsets[tid])
+    anchor_rot = wp.normalize(wp.mul(plug_rot, anchor_rotations[tid]))
+    cable_body_q[anchor_idx] = wp.transform(anchor_world, anchor_rot)
+    cable_body_qd[anchor_idx] = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+
+@wp.kernel
+def _copy_split_cable_to_proxy_kernel(
+    cable_body_q: wp.array(dtype=wp.transform),
+    cable_body_qd: wp.array(dtype=wp.spatial_vector),
+    proxy_body_q: wp.array(dtype=wp.transform),
+    proxy_body_qd: wp.array(dtype=wp.spatial_vector),
+    cable_body_ids: wp.array(dtype=wp.int32),
+    proxy_body_ids: wp.array(dtype=wp.int32),
+) -> None:
+    """Copy sidecar VBD cable transforms into the MJWarp-compatible proxy."""
+    tid = wp.tid()
+    cable_body_id = cable_body_ids[tid]
+    proxy_body_id = proxy_body_ids[tid]
+    proxy_body_q[proxy_body_id] = cable_body_q[cable_body_id]
+    proxy_body_qd[proxy_body_id] = cable_body_qd[cable_body_id]
 
 
 @wp.kernel
@@ -300,16 +383,43 @@ def _active_solver_type() -> str:
             return solver_type
     except Exception as exc:
         logger.debug("Unable to query active Newton solver type for RJ45 cable: %s", exc)
+
+    try:
+        from isaaclab.physics import PhysicsManager
+
+        physics_cfg = PhysicsManager._cfg
+        solver_cfg = getattr(physics_cfg, "solver_cfg", None)
+        solver_type = str(getattr(solver_cfg, "solver_type", "")).lower()
+        if solver_type:
+            return solver_type
+    except Exception as exc:
+        logger.debug("Unable to query PhysicsManager solver type for RJ45 cable: %s", exc)
+
     return "" if _STATE is None else _STATE.solver_type
 
 
-def _should_build_vbd_rods() -> bool:
-    """Return whether the current backend supports Newton cable joints."""
-    return _active_solver_type() == "vbd"
+def _resolve_cable_builder_mode() -> str:
+    """Return the RJ45 cable representation supported by the active Newton solver."""
+    solver_type = _active_solver_type()
+    if solver_type == "rj45_mjwarp_vbd_cable":
+        return "split_vbd_proxy"
+    if solver_type == "mujoco_warp":
+        return "mjwarp_d6"
+    if solver_type == "vbd":
+        raise RuntimeError(
+            "RJ45 env.sim=newton_vbd no longer routes the whole scene through SolverVBD. "
+            "Use the task preset's RJ45SplitCableSolverCfg so MJWarp owns robot/plug/socket "
+            "and VBD owns only the cable sidecar."
+        )
+    raise RuntimeError(
+        "RJ45 cable supports only env.sim=newton_vbd (rigid scene + VBD rod cable) "
+        "or env.sim=newton_mjwarp (MJWarp rigid scene + rigid D6 cable proxy). "
+        f"Active Newton solver_type={solver_type!r}; refusing to build a cable representation implicitly."
+    )
 
 
 def _color_cable_rods(builder) -> None:
-    """Color the Newton builder when real VBD rods were registered."""
+    """Color a main-model VBD rod builder if a legacy caller registered one."""
     if _STATE is not None and _STATE.uses_vbd_rods:
         builder.color()
 
@@ -320,10 +430,13 @@ def _add_cable_to_builder_world(
     env_position: list[float],
     env_rotation: list[float] | tuple[float, float, float, float],
 ) -> None:
-    """Add one plug-anchored Newton rod cable to the currently open builder world."""
+    """Add one plug-anchored RJ45 cable to the currently open builder world."""
     if _STATE is None:
         return
 
+    import newton
+
+    cable_builder_mode = _resolve_cable_builder_mode()
     if env_idx == 0:
         _STATE.plug_body_ids.clear()
         _STATE.cable_body_ids_per_env.clear()
@@ -334,6 +447,20 @@ def _add_cable_to_builder_world(
         _STATE.align_body_ids.clear()
         _STATE.align_next_body_ids.clear()
         _STATE.uses_vbd_rods = False
+        _STATE.uses_split_vbd_sidecar = cable_builder_mode == "split_vbd_proxy"
+        _STATE.sidecar_builder = newton.ModelBuilder() if _STATE.uses_split_vbd_sidecar else None
+        _STATE.sidecar_model = None
+        _STATE.sidecar_state_0 = None
+        _STATE.sidecar_state_1 = None
+        _STATE.sidecar_control = None
+        _STATE.sidecar_solver = None
+        _STATE.sidecar_body_ids_per_env.clear()
+        _STATE.sidecar_joint_ids.clear()
+        _STATE.sidecar_anchor_body_ids.clear()
+        _STATE.sidecar_anchor_offsets.clear()
+        _STATE.sidecar_anchor_rotations.clear()
+        _STATE.sidecar_align_body_ids.clear()
+        _STATE.sidecar_align_next_body_ids.clear()
 
     plug_body_id = _find_plug_body_id(builder, env_idx)
     filtered_shape_ids = set(builder.body_shapes[plug_body_id])
@@ -343,31 +470,58 @@ def _add_cable_to_builder_world(
 
     cable_points = _make_world_cable_points(_STATE, env_position, env_rotation)
 
-    import newton
-
     cable_quats = newton.utils.create_parallel_transport_cable_quaternions(cable_points)
     plug_pos_w, plug_rot_w = _make_plug_world_pose(_STATE, env_position, env_rotation)
     plug_rot_w_inv = wp.quat_inverse(plug_rot_w)
     root_anchor_offset = wp.quat_rotate(plug_rot_w_inv, cable_points[0] - plug_pos_w)
     root_anchor_rot = wp.normalize(wp.mul(plug_rot_w_inv, cable_quats[0]))
 
-    if _should_build_vbd_rods():
-        _STATE.uses_vbd_rods = True
-        cable_cfg = dataclasses.replace(
-            builder.default_shape_cfg,
+    if cable_builder_mode == "split_vbd_proxy":
+        if _STATE.sidecar_builder is None:
+            raise RuntimeError("RJ45 VBD cable sidecar builder was not initialized.")
+        _STATE.sidecar_builder.begin_world()
+        sidecar_cfg = dataclasses.replace(
+            _STATE.sidecar_builder.default_shape_cfg,
             ke=CABLE_ROD_CONTACT_KE,
             kd=CABLE_ROD_CONTACT_KD,
             mu=CABLE_FRICTION,
         )
-        rod_bodies, rod_joints = _add_vbd_rod_cable(
+        sidecar_bodies, sidecar_joints = _add_vbd_rod_cable(
+            builder=_STATE.sidecar_builder,
+            positions=cable_points,
+            quaternions=cable_quats,
+            cfg=sidecar_cfg,
+            label=f"rj45_vbd_cable_{env_idx}",
+        )
+        _STATE.sidecar_builder.end_world()
+        _STATE.sidecar_body_ids_per_env.append(sidecar_bodies)
+        _STATE.sidecar_joint_ids.extend(int(joint_id) for joint_id in sidecar_joints)
+
+        # MJWarp cannot own JointType.CABLE. The main model gets a non-colliding
+        # tiny-mass capsule chain solely so the Newton viewer has cable bodies
+        # to display; its transforms are overwritten from the VBD sidecar.
+        proxy_cfg = dataclasses.replace(
+            builder.default_shape_cfg,
+            has_shape_collision=False,
+            has_particle_collision=False,
+            is_solid=False,
+            ke=0.0,
+            kd=0.0,
+            mu=0.0,
+        )
+        rod_bodies, _ = _add_d6_capsule_chain(
             builder=builder,
             positions=cable_points,
             quaternions=cable_quats,
-            cfg=cable_cfg,
-            label=f"rj45_cable_{env_idx}",
+            cfg=proxy_cfg,
+            label=f"rj45_cable_proxy_{env_idx}",
+            root_parent_body_id=plug_body_id,
+            root_parent_xform=wp.transform(root_anchor_offset, root_anchor_rot),
+            warn_far_end_skip=False,
         )
-        _STATE.cable_joint_ids.extend(int(joint_id) for joint_id in rod_joints)
-    else:
+        for body_id in rod_bodies:
+            _set_body_visual_proxy(builder, body_id)
+    elif cable_builder_mode == "mjwarp_d6":
         global _WARNED_D6_FALLBACK
         if not _WARNED_D6_FALLBACK:
             logger.warning(
@@ -377,9 +531,9 @@ def _add_cable_to_builder_world(
             _WARNED_D6_FALLBACK = True
         cable_cfg = dataclasses.replace(
             builder.default_shape_cfg,
-            ke=CABLE_CONTACT_KE,
-            kd=CABLE_CONTACT_KD,
-            mu=CABLE_FRICTION,
+            ke=CABLE_D6_CONTACT_KE,
+            kd=CABLE_D6_CONTACT_KD,
+            mu=CABLE_D6_FRICTION,
         )
         rod_bodies, _ = _add_d6_capsule_chain(
             builder=builder,
@@ -390,6 +544,8 @@ def _add_cable_to_builder_world(
             root_parent_body_id=plug_body_id,
             root_parent_xform=wp.transform(root_anchor_offset, root_anchor_rot),
         )
+    else:
+        raise AssertionError(f"Unhandled RJ45 cable builder mode: {cable_builder_mode}")
 
     # Prefix capsules overlap the plug at rest. Filtering these pairs prevents
     # the contact solver from fighting the kinematic teleport every substep.
@@ -400,32 +556,51 @@ def _add_cable_to_builder_world(
 
     _STATE.plug_body_ids.append(plug_body_id)
     _STATE.cable_body_ids_per_env.append(rod_bodies)
-    if _STATE.uses_vbd_rods:
+    if _STATE.uses_split_vbd_sidecar:
         # Match Newton's RJ45 example: include the last kinematic body so the
         # rendered boot segment points at the first dynamic body after bending.
         align_start = max(CABLE_KINEMATIC_COUNT - 1, 0)
-        for segment_id in range(align_start, len(rod_bodies) - 1):
-            _STATE.align_body_ids.append(rod_bodies[segment_id])
-            _STATE.align_next_body_ids.append(rod_bodies[segment_id + 1])
+        align_bodies = sidecar_bodies
+        align_body_ids = _STATE.sidecar_align_body_ids
+        align_next_body_ids = _STATE.sidecar_align_next_body_ids
+        for segment_id in range(align_start, len(align_bodies) - 1):
+            align_body_ids.append(align_bodies[segment_id])
+            align_next_body_ids.append(align_bodies[segment_id + 1])
 
     for prefix_id in range(CABLE_KINEMATIC_COUNT):
-        anchor_body_id = rod_bodies[prefix_id]
         anchor_pos_w = cable_points[prefix_id]
         anchor_rot_w = cable_quats[prefix_id]
-        _STATE.anchor_body_ids.append(anchor_body_id)
-        _STATE.anchor_offsets.append(wp.quat_rotate(plug_rot_w_inv, anchor_pos_w - plug_pos_w))
-        _STATE.anchor_rotations.append(wp.normalize(wp.mul(plug_rot_w_inv, anchor_rot_w)))
+        anchor_offset = wp.quat_rotate(plug_rot_w_inv, anchor_pos_w - plug_pos_w)
+        anchor_rotation = wp.normalize(wp.mul(plug_rot_w_inv, anchor_rot_w))
+        if _STATE.uses_split_vbd_sidecar:
+            _STATE.sidecar_anchor_body_ids.append(sidecar_bodies[prefix_id])
+            _STATE.sidecar_anchor_offsets.append(anchor_offset)
+            _STATE.sidecar_anchor_rotations.append(anchor_rotation)
+        else:
+            _STATE.anchor_body_ids.append(rod_bodies[prefix_id])
+            _STATE.anchor_offsets.append(anchor_offset)
+            _STATE.anchor_rotations.append(anchor_rotation)
 
 
 def _on_physics_ready(_payload: Any) -> None:
-    """Create device arrays and install the per-step anchor sync callback."""
-    if _STATE is None or not _STATE.anchor_body_ids:
+    """Create device arrays and install cable stepping state."""
+    if _STATE is None:
         return
 
     from isaaclab_newton.physics import NewtonManager
 
     device = NewtonManager.get_device()
     _STATE.plug_body_ids_wp = wp.array(_STATE.plug_body_ids, dtype=wp.int32, device=device)
+    if _STATE.uses_split_vbd_sidecar:
+        _initialize_split_vbd_sidecar(device)
+        sync_split_vbd_cable_from_rigid_state(NewtonManager.get_state_0())
+        _copy_split_vbd_cable_to_proxy(NewtonManager.get_state_0())
+        logger.info("Registered RJ45 split VBD cable sidecar for %d environments.", len(_STATE.plug_body_ids))
+        return
+
+    if not _STATE.anchor_body_ids:
+        return
+
     _STATE.anchor_body_ids_wp = wp.array(_STATE.anchor_body_ids, dtype=wp.int32, device=device)
     _STATE.anchor_offsets_wp = wp.array(_STATE.anchor_offsets, dtype=wp.vec3, device=device)
     _STATE.anchor_rotations_wp = wp.array(_STATE.anchor_rotations, dtype=wp.quat, device=device)
@@ -441,8 +616,62 @@ def _on_physics_ready(_payload: Any) -> None:
     logger.info("Registered RJ45 cable sync for %d environments.", len(_STATE.plug_body_ids))
 
 
+def _initialize_split_vbd_sidecar(device: str) -> None:
+    """Finalize the cable-only VBD model and allocate sidecar device arrays."""
+    if _STATE is None or _STATE.sidecar_builder is None:
+        raise RuntimeError("RJ45 VBD cable sidecar was requested before its builder was created.")
+    if not _STATE.sidecar_anchor_body_ids:
+        raise RuntimeError("RJ45 VBD cable sidecar has no kinematic prefix bodies to sync.")
+
+    import newton
+    from newton.solvers import SolverVBD
+
+    _STATE.sidecar_builder.color()
+    model = _STATE.sidecar_builder.finalize(device=device)
+    state_0 = model.state()
+    state_1 = model.state()
+    control = model.control()
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0, None)
+    state_1.assign(state_0)
+
+    solver = SolverVBD(
+        model,
+        iterations=12,
+        friction_epsilon=0.1,
+        rigid_contact_hard=False,
+        rigid_contact_k_start=1.0e5,
+        rigid_body_contact_buffer_size=256,
+    )
+    configure_vbd_cable_solver(solver, model, joint_ids=_STATE.sidecar_joint_ids)
+
+    _STATE.sidecar_model = model
+    _STATE.sidecar_state_0 = state_0
+    _STATE.sidecar_state_1 = state_1
+    _STATE.sidecar_control = control
+    _STATE.sidecar_solver = solver
+
+    sidecar_body_ids = [body_id for body_ids in _STATE.sidecar_body_ids_per_env for body_id in body_ids]
+    proxy_body_ids = [body_id for body_ids in _STATE.cable_body_ids_per_env for body_id in body_ids]
+    if len(sidecar_body_ids) != len(proxy_body_ids):
+        raise RuntimeError(
+            "RJ45 sidecar cable and MJWarp proxy body counts differ: "
+            f"{len(sidecar_body_ids)} vs {len(proxy_body_ids)}."
+        )
+
+    _STATE.sidecar_anchor_body_ids_wp = wp.array(_STATE.sidecar_anchor_body_ids, dtype=wp.int32, device=device)
+    _STATE.sidecar_anchor_offsets_wp = wp.array(_STATE.sidecar_anchor_offsets, dtype=wp.vec3, device=device)
+    _STATE.sidecar_anchor_rotations_wp = wp.array(_STATE.sidecar_anchor_rotations, dtype=wp.quat, device=device)
+    _STATE.sidecar_body_ids_wp = wp.array(sidecar_body_ids, dtype=wp.int32, device=device)
+    _STATE.proxy_body_ids_wp = wp.array(proxy_body_ids, dtype=wp.int32, device=device)
+    if _STATE.sidecar_align_body_ids:
+        _STATE.sidecar_align_body_ids_wp = wp.array(_STATE.sidecar_align_body_ids, dtype=wp.int32, device=device)
+        _STATE.sidecar_align_next_body_ids_wp = wp.array(
+            _STATE.sidecar_align_next_body_ids, dtype=wp.int32, device=device
+        )
+
+
 def _sync_cable_anchors() -> None:
-    """Launch the Warp kernel that keeps kinematic cable bodies on the plug."""
+    """Launch the Warp kernel that keeps kinematic cable prefix bodies on the plug."""
     if (
         _STATE is None
         or _STATE.plug_body_ids_wp is None
@@ -466,6 +695,93 @@ def _sync_cable_anchors() -> None:
             _STATE.anchor_offsets_wp,
             _STATE.anchor_rotations_wp,
             CABLE_KINEMATIC_COUNT,
+        ],
+        device=NewtonManager.get_device(),
+    )
+
+
+def sync_split_vbd_cable_from_rigid_state(rigid_state: Any) -> None:
+    """Sync the sidecar cable prefix from the current rigid plug poses."""
+    if (
+        _STATE is None
+        or not _STATE.uses_split_vbd_sidecar
+        or _STATE.sidecar_state_0 is None
+        or _STATE.plug_body_ids_wp is None
+        or _STATE.sidecar_anchor_body_ids_wp is None
+        or _STATE.sidecar_anchor_offsets_wp is None
+        or _STATE.sidecar_anchor_rotations_wp is None
+    ):
+        return
+
+    from isaaclab_newton.physics import NewtonManager
+
+    wp.launch(
+        kernel=_sync_split_cable_anchors_kernel,
+        dim=len(_STATE.sidecar_anchor_body_ids),
+        inputs=[
+            rigid_state.body_q,
+            _STATE.sidecar_state_0.body_q,
+            _STATE.sidecar_state_0.body_qd,
+            _STATE.plug_body_ids_wp,
+            _STATE.sidecar_anchor_body_ids_wp,
+            _STATE.sidecar_anchor_offsets_wp,
+            _STATE.sidecar_anchor_rotations_wp,
+            CABLE_KINEMATIC_COUNT,
+        ],
+        device=NewtonManager.get_device(),
+    )
+
+
+def step_split_vbd_cable(rigid_state: Any, dt: float) -> None:
+    """Step the cable-only VBD model and copy it into the rigid-scene proxy."""
+    if (
+        _STATE is None
+        or not _STATE.uses_split_vbd_sidecar
+        or _STATE.sidecar_solver is None
+        or _STATE.sidecar_state_0 is None
+        or _STATE.sidecar_state_1 is None
+        or _STATE.sidecar_control is None
+    ):
+        return
+
+    # Sync immediately before the VBD solve so the rod root follows the plug
+    # pose produced by the just-completed MJWarp rigid substep.
+    sync_split_vbd_cable_from_rigid_state(rigid_state)
+    _STATE.sidecar_solver.step(
+        _STATE.sidecar_state_0,
+        _STATE.sidecar_state_1,
+        _STATE.sidecar_control,
+        None,
+        dt,
+    )
+    _align_split_cable_orientations(_STATE.sidecar_state_1)
+    _STATE.sidecar_state_0, _STATE.sidecar_state_1 = _STATE.sidecar_state_1, _STATE.sidecar_state_0
+    _copy_split_vbd_cable_to_proxy(rigid_state)
+    _STATE.sidecar_state_0.clear_forces()
+
+
+def _copy_split_vbd_cable_to_proxy(rigid_state: Any) -> None:
+    """Copy solved VBD cable poses into the main MJWarp proxy bodies."""
+    if (
+        _STATE is None
+        or _STATE.sidecar_state_0 is None
+        or _STATE.sidecar_body_ids_wp is None
+        or _STATE.proxy_body_ids_wp is None
+    ):
+        return
+
+    from isaaclab_newton.physics import NewtonManager
+
+    wp.launch(
+        kernel=_copy_split_cable_to_proxy_kernel,
+        dim=_STATE.sidecar_body_ids_wp.shape[0],
+        inputs=[
+            _STATE.sidecar_state_0.body_q,
+            _STATE.sidecar_state_0.body_qd,
+            rigid_state.body_q,
+            rigid_state.body_qd,
+            _STATE.sidecar_body_ids_wp,
+            _STATE.proxy_body_ids_wp,
         ],
         device=NewtonManager.get_device(),
     )
@@ -495,11 +811,38 @@ def _align_cable_orientations(state: Any) -> None:
     )
 
 
+def _align_split_cable_orientations(state: Any) -> None:
+    """Align sidecar cable capsules before copying them into the visual proxy."""
+    if (
+        _STATE is None
+        or _STATE.sidecar_align_body_ids_wp is None
+        or _STATE.sidecar_align_next_body_ids_wp is None
+    ):
+        return
+
+    from isaaclab_newton.physics import NewtonManager
+
+    wp.launch(
+        kernel=_align_cable_orientations_kernel,
+        dim=len(_STATE.sidecar_align_body_ids),
+        inputs=[
+            state.body_q,
+            _STATE.sidecar_align_body_ids_wp,
+            _STATE.sidecar_align_next_body_ids_wp,
+        ],
+        device=NewtonManager.get_device(),
+    )
+
+
 def run_vbd_cable_solver_substeps(manager_cls: type) -> None:
-    """Run VBD substeps with plug-anchor sync before collision.
+    """Legacy helper for the removed main-model VBD rod experiment.
+
+    Current RJ45 presets do not call this path. ``env.sim=newton_vbd`` uses
+    :func:`step_split_vbd_cable` so MJWarp owns the rigid scene and VBD owns
+    only the sidecar cable model.
 
     Args:
-        manager_cls: Active Newton VBD manager class for the task.
+        manager_cls: Legacy Newton VBD manager class.
     """
     if _STATE is None or not _STATE.uses_vbd_rods:
         contacts = manager_cls._contacts if manager_cls._needs_collision_pipeline else None
@@ -551,20 +894,30 @@ def run_vbd_cable_solver_substeps(manager_cls: type) -> None:
         manager_cls._state_0.clear_forces()
 
 
-def configure_vbd_cable_solver(solver: Any, model: Any | None = None) -> None:
+def configure_vbd_cable_solver(solver: Any, model: Any | None = None, joint_ids: list[int] | None = None) -> None:
     """Configure VBD cable joints to use compliant penalty constraints.
 
     Args:
         solver: Active :class:`newton.solvers.SolverVBD` instance.
         model: Optional finalized Newton model, used only as a label fallback.
+        joint_ids: Optional explicit cable joint ids. When omitted, the ids
+            recorded for the active RJ45 cable representation are used.
     """
-    if _STATE is None or not _STATE.uses_vbd_rods or not hasattr(solver, "set_joint_constraint_mode"):
+    if _STATE is None or not hasattr(solver, "set_joint_constraint_mode"):
         return
 
-    joint_ids = list(_STATE.cable_joint_ids)
+    if joint_ids is None:
+        if _STATE.uses_vbd_rods:
+            joint_ids = list(_STATE.cable_joint_ids)
+        elif _STATE.uses_split_vbd_sidecar:
+            joint_ids = list(_STATE.sidecar_joint_ids)
+        else:
+            return
+    else:
+        joint_ids = list(joint_ids)
     if not joint_ids and model is not None:
         joint_labels = getattr(model, "joint_label", None) or getattr(model, "joint_key", None) or []
-        joint_ids = [joint_id for joint_id, label in enumerate(joint_labels) if "rj45_cable_" in str(label)]
+        joint_ids = [joint_id for joint_id, label in enumerate(joint_labels) if "rj45" in str(label)]
 
     for joint_id in joint_ids:
         # SolverVBD defaults structural joints to hard constraints. Cable bend
@@ -618,6 +971,34 @@ def _set_body_kinematic(builder, body_id: int) -> None:
     builder.body_inv_mass[body_id] = 0.0
     builder.body_inertia[body_id] = wp.mat33(0.0)
     builder.body_inv_inertia[body_id] = wp.mat33(0.0)
+
+
+def _set_body_visual_proxy(builder, body_id: int) -> None:
+    """Set a tiny positive mass so MJWarp accepts a visual-only proxy body."""
+    builder.body_mass[body_id] = CABLE_VISUAL_PROXY_MASS
+    builder.body_inv_mass[body_id] = 1.0 / CABLE_VISUAL_PROXY_MASS
+    builder.body_inertia[body_id] = wp.mat33(
+        CABLE_VISUAL_PROXY_INERTIA,
+        0.0,
+        0.0,
+        0.0,
+        CABLE_VISUAL_PROXY_INERTIA,
+        0.0,
+        0.0,
+        0.0,
+        CABLE_VISUAL_PROXY_INERTIA,
+    )
+    builder.body_inv_inertia[body_id] = wp.mat33(
+        1.0 / CABLE_VISUAL_PROXY_INERTIA,
+        0.0,
+        0.0,
+        0.0,
+        1.0 / CABLE_VISUAL_PROXY_INERTIA,
+        0.0,
+        0.0,
+        0.0,
+        1.0 / CABLE_VISUAL_PROXY_INERTIA,
+    )
 
 
 def _add_vbd_rod_cable(
@@ -678,6 +1059,7 @@ def _add_d6_capsule_chain(
     label: str,
     root_parent_body_id: int,
     root_parent_xform: wp.transform,
+    warn_far_end_skip: bool = True,
 ):
     """Add an MJWarp-compatible bend-stiff capsule chain.
 
@@ -689,6 +1071,8 @@ def _add_d6_capsule_chain(
         label: Prefix for generated body, shape, joint, and articulation labels.
         root_parent_body_id: Plug body index to attach the cable root to.
         root_parent_xform: Cable root transform in the plug frame.
+        warn_far_end_skip: Whether to warn that the D6 approximation skips the
+            far-end VBD anchor.
 
     Returns:
         Tuple of created body indices and joint indices.
@@ -757,7 +1141,7 @@ def _add_d6_capsule_chain(
             )
         )
 
-    if LOCK_FAR_END:
+    if LOCK_FAR_END and warn_far_end_skip:
         global _WARNED_D6_FAR_END_SKIP
         if not _WARNED_D6_FAR_END_SKIP:
             logger.warning(
@@ -782,7 +1166,7 @@ def _make_bend_axes(builder) -> list:
             limit_ke=0.0,
             limit_kd=0.0,
             target_ke=bend_stiffness,
-            target_kd=CABLE_BEND_DAMPING,
+            target_kd=CABLE_D6_BEND_DAMPING,
             effort_limit=1.0e6,
         )
         for axis in (wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0, 1.0, 0.0), wp.vec3(0.0, 0.0, 1.0))
