@@ -80,9 +80,18 @@ class RJ45VBDSolverCfg(VBDSolverCfg):
     rigid_body_contact_buffer_size: int = 256
     """Per-rigid-body contact buffer size."""
 
+    rigid_contact_hard: bool = False
+    """Whether VBD rigid contacts use hard contact constraints."""
+
 
 class NewtonRJ45VBDManager(NewtonVBDManager):
     """Task-local VBD manager that supports rigid rods without particles."""
+
+    @classmethod
+    def _build_solver(cls, model, solver_cfg) -> None:
+        """Build the VBD solver and make cable joints compliant."""
+        super()._build_solver(model, solver_cfg)
+        cable_mdp.configure_vbd_cable_solver(cls._solver, model)
 
     @classmethod
     def _simulate_full(cls) -> None:
@@ -153,6 +162,7 @@ class RJ45SimCfg(PresetCfg):
             solver_cfg=RJ45VBDSolverCfg(
                 iterations=12,
                 friction_epsilon=0.1,
+                rigid_contact_hard=False,
                 rigid_contact_k_start=1.0e5,
                 rigid_body_contact_buffer_size=256,
             ),

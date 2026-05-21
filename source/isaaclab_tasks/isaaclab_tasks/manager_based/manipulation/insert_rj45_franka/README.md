@@ -37,7 +37,7 @@ Primitive smoke test:
 USD-backed task after asset prep:
 
 ```bash
-./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py --task Isaac-Insert-RJ45-Franka-v0 --visualizer newton env.sim=newton_mjwarp env.events=newton_mjwarp
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py --task Isaac-Insert-RJ45-Franka-v0 --visualizer newton env.sim=newton_vbd env.events=newton_vbd
 ```
 
 Play variants are available as `Isaac-Insert-RJ45-Franka-Play-v0` and `Isaac-Insert-RJ45-Franka-Stub-Play-v0`.
@@ -55,12 +55,14 @@ bootstrap. It includes the clip/latch mesh, so modeling the clip as a separate f
 hinged latch remains a focused follow-up.
 
 The USD-backed task also installs a Newton builder hook that adds one bend-stiff capsule-chain cable per environment.
-The chain uses MJWarp-compatible D6 joints because MJWarp does not currently convert Newton's `JointType.CABLE`.
-The cable root is fixed to the plug body, and the first four cable bodies follow the plug before the solver runs,
-matching Newton's RJ45 example. In this D6 fallback, the chain is never fixed to the world because that makes the cable
-look static when the plug moves; non-root D6 children also keep normal mass because zero-mass children can destabilize
-MJWarp. The middle links remain dynamic so the cable can sag and settle on the table. The stub task intentionally stays
-cable-free.
+With the `newton_vbd` preset this is Newton's `ModelBuilder.add_rod(...)` path: each segment is a capsule body and each
+neighboring pair is connected by a `JointType.CABLE` joint, which VBD evaluates with stretch and bend/twist energies.
+The first four cable bodies follow the plug before the solver runs, and the far end is massless and fixed in world
+space, matching Newton's RJ45 example. The middle links remain dynamic so the cable can sag and settle on the table.
+
+The `newton_mjwarp` preset keeps an MJWarp-compatible D6-joint fallback because MJWarp does not currently support
+Newton's `JointType.CABLE` rod joints. Use `newton_vbd` when validating the physical cable behavior. The stub task
+intentionally stays cable-free.
 
 The reward includes grasp-maintenance terms: one keeps a plug-frame grasp point behind the exposed connector near the
 TCP, and one rewards the finger joints staying at the tight grasp target. These terms are intentionally active for the

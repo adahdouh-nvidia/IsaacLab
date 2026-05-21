@@ -43,40 +43,40 @@ logger = logging.getLogger(__name__)
 CABLE_RADIUS: float = 0.00325
 """Cable capsule radius [m]."""
 
-CABLE_BEND_STIFFNESS: float = 10.0
+CABLE_BEND_STIFFNESS: float = 1.0
 """Cable bend stiffness [N*m/rad]."""
 
-CABLE_BEND_DAMPING: float = 0.1
+CABLE_BEND_DAMPING: float = 0.02
 """Cable bend damping."""
 
-CABLE_ROD_BEND_STIFFNESS: float = 0.1
+CABLE_ROD_BEND_STIFFNESS: float = 0.01
 """VBD rod bend stiffness [N*m/rad]."""
 
-CABLE_ROD_STRETCH_STIFFNESS: float = 1.0e9
+CABLE_ROD_STRETCH_STIFFNESS: float = 2.0e4
 """VBD rod stretch stiffness [N/m]."""
 
-CABLE_ROD_STRETCH_DAMPING: float = 0.1
+CABLE_ROD_STRETCH_DAMPING: float = 0.0
 """VBD rod stretch damping."""
 
-CABLE_CONTACT_KE: float = 1.0e5
+CABLE_CONTACT_KE: float = 2.0e4
 """Cable contact stiffness [N/m]."""
 
 CABLE_CONTACT_KD: float = 0.0
 """Cable contact damping."""
 
-CABLE_ROD_CONTACT_KE: float = 1.0e8
+CABLE_ROD_CONTACT_KE: float = CABLE_CONTACT_KE
 """VBD rod contact stiffness [N/m]."""
 
-CABLE_ROD_CONTACT_KD: float = 1.0e-3
+CABLE_ROD_CONTACT_KD: float = CABLE_CONTACT_KD
 """VBD rod contact damping."""
 
-CABLE_FRICTION: float = 2.0
+CABLE_FRICTION: float = 1.0
 """Cable friction coefficient."""
 
 CABLE_RENDER_COLOR: wp.vec3 = wp.vec3(0.0, 0.65, 0.12)
 """Cable capsule render color."""
 
-CABLE_D6_BEND_STIFFNESS_SCALE: float = 1.0e-3
+CABLE_D6_BEND_STIFFNESS_SCALE: float = 2.0e-4
 """Scale applied to the reference bend stiffness for the MJWarp D6 fallback."""
 
 CABLE_KINEMATIC_COUNT: int = 4
@@ -104,6 +104,7 @@ class _CableState:
     source_points: tuple[wp.vec3, ...] | None = None
     plug_body_ids: list[int] = field(default_factory=list)
     cable_body_ids_per_env: list[list[int]] = field(default_factory=list)
+    cable_joint_ids: list[int] = field(default_factory=list)
     anchor_body_ids: list[int] = field(default_factory=list)
     anchor_offsets: list[wp.vec3] = field(default_factory=list)
     anchor_rotations: list[wp.quat] = field(default_factory=list)
@@ -122,6 +123,7 @@ class _CableState:
 
 _STATE: _CableState | None = None
 _WARNED_D6_FAR_END_SKIP = False
+_WARNED_D6_FALLBACK = False
 
 
 @wp.kernel
@@ -325,6 +327,7 @@ def _add_cable_to_builder_world(
     if env_idx == 0:
         _STATE.plug_body_ids.clear()
         _STATE.cable_body_ids_per_env.clear()
+        _STATE.cable_joint_ids.clear()
         _STATE.anchor_body_ids.clear()
         _STATE.anchor_offsets.clear()
         _STATE.anchor_rotations.clear()
@@ -356,14 +359,22 @@ def _add_cable_to_builder_world(
             kd=CABLE_ROD_CONTACT_KD,
             mu=CABLE_FRICTION,
         )
-        rod_bodies, _ = _add_vbd_rod_cable(
+        rod_bodies, rod_joints = _add_vbd_rod_cable(
             builder=builder,
             positions=cable_points,
             quaternions=cable_quats,
             cfg=cable_cfg,
             label=f"rj45_cable_{env_idx}",
         )
+        _STATE.cable_joint_ids.extend(int(joint_id) for joint_id in rod_joints)
     else:
+        global _WARNED_D6_FALLBACK
+        if not _WARNED_D6_FALLBACK:
+            logger.warning(
+                "RJ45 cable is using the MJWarp D6 fallback, not Newton's JointType.CABLE rod path. "
+                "Launch with env.sim=newton_vbd env.events=newton_vbd for the Cosserat-style VBD cable."
+            )
+            _WARNED_D6_FALLBACK = True
         cable_cfg = dataclasses.replace(
             builder.default_shape_cfg,
             ke=CABLE_CONTACT_KE,
@@ -390,7 +401,10 @@ def _add_cable_to_builder_world(
     _STATE.plug_body_ids.append(plug_body_id)
     _STATE.cable_body_ids_per_env.append(rod_bodies)
     if _STATE.uses_vbd_rods:
-        for segment_id in range(CABLE_KINEMATIC_COUNT, len(rod_bodies) - 1):
+        # Match Newton's RJ45 example: include the last kinematic body so the
+        # rendered boot segment points at the first dynamic body after bending.
+        align_start = max(CABLE_KINEMATIC_COUNT - 1, 0)
+        for segment_id in range(align_start, len(rod_bodies) - 1):
             _STATE.align_body_ids.append(rod_bodies[segment_id])
             _STATE.align_next_body_ids.append(rod_bodies[segment_id + 1])
 
@@ -537,6 +551,30 @@ def run_vbd_cable_solver_substeps(manager_cls: type) -> None:
         manager_cls._state_0.clear_forces()
 
 
+def configure_vbd_cable_solver(solver: Any, model: Any | None = None) -> None:
+    """Configure VBD cable joints to use compliant penalty constraints.
+
+    Args:
+        solver: Active :class:`newton.solvers.SolverVBD` instance.
+        model: Optional finalized Newton model, used only as a label fallback.
+    """
+    if _STATE is None or not _STATE.uses_vbd_rods or not hasattr(solver, "set_joint_constraint_mode"):
+        return
+
+    joint_ids = list(_STATE.cable_joint_ids)
+    if not joint_ids and model is not None:
+        joint_labels = getattr(model, "joint_label", None) or getattr(model, "joint_key", None) or []
+        joint_ids = [joint_id for joint_id, label in enumerate(joint_labels) if "rj45_cable_" in str(label)]
+
+    for joint_id in joint_ids:
+        # SolverVBD defaults structural joints to hard constraints. Cable bend
+        # stiffness only affects motion when the rod joints run in compliant
+        # penalty mode, matching Newton's reference RJ45 example.
+        solver.set_joint_constraint_mode(int(joint_id), False)
+
+    logger.info("Configured %d RJ45 cable VBD joints as compliant constraints.", len(joint_ids))
+
+
 def _find_plug_body_id(builder, env_idx: int) -> int:
     """Resolve the plug body index for one builder world."""
     plug_body_id = _find_named_body_id(builder, env_idx, "Plug", required=True)
@@ -575,7 +613,7 @@ def _find_named_body_id(builder, env_idx: int, body_name: str, required: bool = 
 
 
 def _set_body_kinematic(builder, body_id: int) -> None:
-    """Set a Newton builder body to zero mass/inertia."""
+    """Set a Newton builder body to zero mass and inertia."""
     builder.body_mass[body_id] = 0.0
     builder.body_inv_mass[body_id] = 0.0
     builder.body_inertia[body_id] = wp.mat33(0.0)
@@ -617,11 +655,13 @@ def _add_vbd_rod_cable(
     # reference demo. Massless bodies are cheaper and more stable than adding
     # explicit fixed joints because the sync kernel overwrites their poses each
     # substep before collision detection.
-    for body_id in rod_bodies[:CABLE_KINEMATIC_COUNT]:
-        _set_body_kinematic(builder, body_id)
+    kinematic_body_ids = list(rod_bodies[:CABLE_KINEMATIC_COUNT])
     if LOCK_FAR_END:
         # The far end is a world-space anchor, matching the Newton RJ45 example.
-        _set_body_kinematic(builder, rod_bodies[-1])
+        kinematic_body_ids.append(rod_bodies[-1])
+
+    for body_id in kinematic_body_ids:
+        _set_body_kinematic(builder, body_id)
 
     for body_id in rod_bodies:
         for shape_id in builder.body_shapes[body_id]:
