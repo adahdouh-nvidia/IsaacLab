@@ -17,6 +17,12 @@ Lab checkout, so the ``newton_vbd`` preset keeps MJWarp as the rigid scene
 solver and builds the true rod in a separate cable-only VBD sidecar model. The
 ``newton_mjwarp`` preset remains a rigid D6 capsule-chain approximation only.
 
+The sidecar is intentionally one-way coupled: the cable root follows the MJWarp
+plug every substep, and the far cable end is pinned in the sidecar world, but
+the cable does not feed forces back into the plug. The task reset and gripper
+events therefore keep the plug reasonably located so the pinned cable does not
+become an unintended restraint on a falling plug.
+
 Implemented against Isaac Lab develop commit
 ``53bc3e02d7b1b798355cbbf2e155999bbff7a543``.
 """
@@ -43,6 +49,9 @@ logger = logging.getLogger(__name__)
 CABLE_RADIUS: float = 0.00325
 """Cable capsule radius [m]."""
 
+# Keep these cable constants aligned with the Newton RJ45 reference setup. A
+# softer tuning such as stretch/contact 1e5 with zero damping can be tested as a
+# separate profile, but the default path stays on the reference-style values.
 CABLE_BEND_STIFFNESS: float = 0.1
 """Reference cable bend stiffness [N*m/rad]."""
 
@@ -104,7 +113,7 @@ KINEMATIC_PREFIX_COUNT: int = CABLE_KINEMATIC_COUNT
 """Backward-compatible alias for the cable kinematic prefix count."""
 
 LOCK_FAR_END: bool = True
-"""Whether the far cable end is pinned in world space for the VBD rod path."""
+"""Whether the far cable end is pinned in the cable-only VBD sidecar world."""
 
 SOURCE_CABLE_CURVE_PATH = "/World/CableCurve"
 SOURCE_PLUG_PATH = "/World/Plug"
@@ -504,7 +513,8 @@ def _add_cable_to_builder_world(
             builder.default_shape_cfg,
             has_shape_collision=False,
             has_particle_collision=False,
-            is_solid=False,
+            is_visible=True,
+            is_solid=True,
             ke=0.0,
             kd=0.0,
             mu=0.0,
@@ -623,7 +633,6 @@ def _initialize_split_vbd_sidecar(device: str) -> None:
     if not _STATE.sidecar_anchor_body_ids:
         raise RuntimeError("RJ45 VBD cable sidecar has no kinematic prefix bodies to sync.")
 
-    import newton
     from newton.solvers import SolverVBD
 
     _STATE.sidecar_builder.color()
@@ -631,7 +640,6 @@ def _initialize_split_vbd_sidecar(device: str) -> None:
     state_0 = model.state()
     state_1 = model.state()
     control = model.control()
-    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0, None)
     state_1.assign(state_0)
 
     solver = SolverVBD(
@@ -745,7 +753,8 @@ def step_split_vbd_cable(rigid_state: Any, dt: float) -> None:
         return
 
     # Sync immediately before the VBD solve so the rod root follows the plug
-    # pose produced by the just-completed MJWarp rigid substep.
+    # pose produced by the just-completed MJWarp rigid substep. This is
+    # plug-to-cable only; the sidecar does not push cable forces back to MJWarp.
     sync_split_vbd_cable_from_rigid_state(rigid_state)
     _STATE.sidecar_solver.step(
         _STATE.sidecar_state_0,

@@ -28,7 +28,7 @@ regenerated with the body and clip in one normalized rigid frame.
 
 ## Run
 
-Primitive smoke test:
+Cable-free primitive smoke test:
 
 ```bash
 ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py --task Isaac-Insert-RJ45-Franka-Stub-v0 --visualizer newton env.sim=newton_mjwarp env.events=newton_mjwarp
@@ -54,11 +54,13 @@ The socket is kinematic, while the plug is one dynamic rigid object with gravity
 bootstrap. It includes the clip/latch mesh, so modeling the clip as a separate free body is avoided; adding a true
 hinged latch remains a focused follow-up.
 
-The USD-backed task also installs a Newton builder hook that adds one bend-stiff capsule-chain cable per environment.
-With the `newton_vbd` preset this is Newton's `ModelBuilder.add_rod(...)` path: each segment is a capsule body and each
-neighboring pair is connected by a `JointType.CABLE` joint, which VBD evaluates with stretch and bend/twist energies.
-The first four cable bodies follow the plug before the solver runs, and the far end is massless and fixed in world
-space, matching Newton's RJ45 example. The middle links remain dynamic so the cable can sag and settle on the table.
+The USD-backed task also installs a Newton builder hook that adds one cable per environment. With the `newton_vbd`
+preset, the rigid scene stays on the MJWarp path while a cable-only VBD sidecar owns Newton's
+`ModelBuilder.add_rod(...)` model. A non-colliding solid capsule proxy is added to the rigid scene so the Newton viewer
+can render the sidecar cable poses. The first four sidecar cable bodies follow the plug before each VBD solve, and the
+far end is massless and fixed in the sidecar world, matching Newton's RJ45 example. The middle links remain dynamic so
+the cable can sag and settle on the table. This cable is visible in the Newton viewer (`--visualizer newton`), not as a
+USD-authored cable in the Isaac Sim viewport.
 
 The `newton_mjwarp` preset keeps an MJWarp-compatible D6-joint fallback because MJWarp does not currently support
 Newton's `JointType.CABLE` rod joints. Use `newton_vbd` when validating the physical cable behavior. The stub task
